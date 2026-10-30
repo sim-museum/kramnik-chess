@@ -1,0 +1,527 @@
+diff --git a/src/cmpersonality.h b/src/cmpersonality.h
+new file mode 100644
+index 00000000..2fc0cefe
+--- /dev/null
++++ b/src/cmpersonality.h
+@@ -0,0 +1,60 @@
++/*
++  Chessmaster-style personality weights for Fairy-Stockfish (Kramnik chess sprint CM-2, 2026-10-06).
++
++  Every weight is relative to the side the engine plays at the root ("own") or the other side ("opp"), as in a
++  Chessmaster personality. All defaults are neutral: 100 % weights, 0 contempt, 0 attack -- the engine is then
++  exactly unchanged. Loaded from the UCI options at the start of each search (MainThread::search).
++*/
++
++#ifndef CMPERSONALITY_H_INCLUDED
++#define CMPERSONALITY_H_INCLUDED
++
++#include "types.h"
++
++namespace Stockfish::CM {
++
++enum Term { CENTRE, MOBILITY, KING_SAFETY, PASSED, PAWN_WEAK, TERM_NB };
++
++struct Weights {
++  int term[2][TERM_NB];          // [own=0 / opp=1][term], percent
++  int material[2][PIECE_TYPE_NB]; // [own / opp][piece type], percent of the standard value
++  int contempt = 0;              // centipawns: a draw is worth -contempt to the engine
++  int attack = 0;                // -100..100: >0 shifts weight from own king safety to the attack on the opponent's king
++  bool active = false;           // any weight away from neutral
++
++  // CM-26 (2026-10-28): the remaining personality settings.
++  Value contemptValue = VALUE_ZERO; // the draw contempt in internal units, scaled by the material left at the root
++  int noise = 0;                 // evaluation noise amplitude, internal units: the same error for the same position
++  int trade = 0;                 // internal units per piece traded since the root (both sides), for the engine's side
++  bool tradeDown = false;        // the side ahead by more than half a pawn gains as the other side's pieces come off
++  int randomness = 0;            // root moves get a fixed bias in [-r/2, r/2] centipawns, one salt per search
++  uint64_t salt = 0;
++  int rootPieces[COLOR_NB] = {}; // knights, bishops, rooks and queens of each colour at the root
++};
++
++inline Weights W;
++inline Color   Root = WHITE;
++
++inline int own_or_opp(Color c) { return c == Root ? 0 : 1; }
++
++// A root move's fixed bias for this search (internal units): stable across iterative deepening.
++inline Value root_bias(Move m) {
++  if (!W.randomness)
++      return VALUE_ZERO;
++  uint64_t h = (W.salt ^ uint64_t(m)) * 0x9E3779B97F4A7C15ULL;
++  h ^= h >> 29;
++  int cp = int(h % uint64_t(W.randomness + 1)) - W.randomness / 2;
++  return Value(cp * PawnValueEg / 100);
++}
++
++inline int term(Color c, Term t) {
++  int w = W.term[own_or_opp(c)][t];
++  if (t == KING_SAFETY && W.attack)
++      // attack > 0: care more about the opponent's king danger (attack), less about our own (defence)
++      w = w * (c == Root ? 100 - W.attack : 100 + W.attack) / 100;
++  return std::max(w, 0);
++}
++
++} // namespace Stockfish::CM
++
++#endif // #ifndef CMPERSONALITY_H_INCLUDED
+diff --git a/src/evaluate.cpp b/src/evaluate.cpp
+index 44184480..fc14f462 100644
+--- a/src/evaluate.cpp
++++ b/src/evaluate.cpp
+@@ -57,6 +57,8 @@
+ 
+ using namespace std;
+ 
++#include "cmpersonality.h"
++
+ namespace Stockfish {
+ 
+ const Variant* currentNnueVariant;
+@@ -1493,11 +1495,57 @@ namespace {
+     Score score = pos.psq_score();
+     if (T)
+         Trace::add(MATERIAL, score);
++
++    // CM-2: a personality's own/opponent piece values, as an adjustment on top of the standard material
++    auto cm = [](Score s, int w) { return make_score(mg_value(s) * w / 100, eg_value(s) * w / 100); };
++    if (CM::W.active)
++        for (Color c : { WHITE, BLACK })
++            for (PieceType pt : { PAWN, KNIGHT, BISHOP, ROOK, QUEEN })
++            {
++                int pct = CM::W.material[CM::own_or_opp(c)][pt];
++                int n = pos.count(c, pt);
++                if (pct != 100 && n)
++                {
++                    Score d = make_score(PieceValue[MG][make_piece(WHITE, pt)] * (pct - 100) / 100 * n,
++                                         PieceValue[EG][make_piece(WHITE, pt)] * (pct - 100) / 100 * n);
++                    score += c == WHITE ? d : -d;
++                }
++            }
++
++    // CM-26 trade attitude: a bonus (or, < 0, a penalty) for the engine's side per piece traded
++    // since the root, both sides counted; only pairs count, so a sacrifice or a self-capture earns nothing.
++    if (CM::W.trade)
++    {
++        auto pieces = [&](Color c) { return pos.count<KNIGHT>(c) + pos.count<BISHOP>(c) + pos.count<ROOK>(c) + pos.count<QUEEN>(c); };
++        int traded = 2 * std::max(0, std::min(CM::W.rootPieces[WHITE] - pieces(WHITE), CM::W.rootPieces[BLACK] - pieces(BLACK)));
++        Value t = Value(CM::W.trade * traded);
++        score += CM::Root == WHITE ? make_score(t, t) : -make_score(t, t);
++    }
++
++    // CM-26 trade down when ahead: more than half a pawn up in material, the side ahead gains
++    // a quarter of its lead as the other side's pieces come off the board, up to a pawn.
++    if (CM::W.tradeDown)
++    {
++        auto material = [&](Color c) { return pos.non_pawn_material(c) + PawnValueMg * pos.count<PAWN>(c); };
++        int lead = material(WHITE) - material(BLACK);
++        if (std::abs(lead) > PawnValueMg / 2)
++        {
++            Color behind = lead > 0 ? BLACK : WHITE;
++            int full = 2 * KnightValueMg + 2 * BishopValueMg + 2 * RookValueMg + QueenValueMg;
++            int off = std::max(0, full - int(pos.non_pawn_material(behind)));
++            Value b = Value(std::min(int(PawnValueEg), std::abs(lead) * off / full / 4));
++            score += lead > 0 ? make_score(b, b) : -make_score(b, b);
++        }
++    }
+     score += me->imbalance() + pos.this_thread()->trend;
+ 
+     // Probe the pawn hash table
+     pe = Pawns::probe(pos);
+-    score += pe->pawn_score(WHITE) - pe->pawn_score(BLACK);
++    if (CM::W.active)
++        score +=  cm(pe->pawn_score(WHITE), CM::term(WHITE, CM::PAWN_WEAK))
++                - cm(pe->pawn_score(BLACK), CM::term(BLACK, CM::PAWN_WEAK));
++    else
++        score += pe->pawn_score(WHITE) - pe->pawn_score(BLACK);
+ 
+     // Early exit if score is high
+     auto lazy_skip = [&](Value lazyThreshold) {
+@@ -1529,16 +1577,32 @@ namespace {
+             score += hand<WHITE>(pt) - hand<BLACK>(pt);
+         }
+ 
++    if (CM::W.active)
++    {
++        score += (  cm(mobility[WHITE], CM::term(WHITE, CM::MOBILITY))
++                  - cm(mobility[BLACK], CM::term(BLACK, CM::MOBILITY)))
++                * (1 + pos.captures_to_hand() + pos.must_capture() + pos.check_counting());
++        score +=  cm(king<  WHITE>(), CM::term(WHITE, CM::KING_SAFETY)) - cm(king<  BLACK>(), CM::term(BLACK, CM::KING_SAFETY))
++                + cm(passed<WHITE>(), CM::term(WHITE, CM::PASSED))      - cm(passed<BLACK>(), CM::term(BLACK, CM::PASSED))
++                + variant<WHITE>() - variant<BLACK>();
++    }
++    else
++    {
+     score += (mobility[WHITE] - mobility[BLACK]) * (1 + pos.captures_to_hand() + pos.must_capture() + pos.check_counting());
+ 
+     // More complex interactions that require fully populated attack bitboards
+     score +=  king<   WHITE>() - king<   BLACK>()
+             + passed< WHITE>() - passed< BLACK>()
+             + variant<WHITE>() - variant<BLACK>();
++    }
+ 
+     if (lazy_skip(LazyThreshold2) && Options["UCI_Variant"] == "chess")
+         goto make_v;
+ 
++    if (CM::W.active)
++        score +=  threats<WHITE>() - threats<BLACK>()
++                + cm(space<WHITE>(), CM::term(WHITE, CM::CENTRE)) - cm(space<BLACK>(), CM::term(BLACK, CM::CENTRE));
++    else
+     score +=  threats<WHITE>() - threats<BLACK>()
+             + space<  WHITE>() - space<  BLACK>();
+ 
+@@ -1646,6 +1710,15 @@ Value Eval::evaluate(const Position& pos) {
+                     : adjusted_NNUE();                   // NNUE
+   }
+ 
++  // CM-26 strength: noise seeded by the position's key, so a position always gets the same error
++  // and the search, the transposition table and iterative deepening agree with each other.
++  if (CM::W.noise)
++  {
++      uint64_t h = uint64_t(pos.key()) * 0x9E3779B97F4A7C15ULL;
++      h ^= h >> 31;
++      v += Value(int(h % uint64_t(CM::W.noise + 1)) - CM::W.noise / 2);
++  }
++
+   // Damp down the evaluation linearly when shuffling
+   if (pos.n_move_rule())
+   {
+diff --git a/src/movegen.cpp b/src/movegen.cpp
+index a7b6a9f9..56efc41d 100644
+--- a/src/movegen.cpp
++++ b/src/movegen.cpp
+@@ -149,7 +149,7 @@ namespace {
+ 
+     const Bitboard pawns      = pos.pieces(Us, PAWN);
+     const Bitboard movable    = pos.board_bb(Us, PAWN) & ~pos.pieces();
+-    const Bitboard capturable = pos.board_bb(Us, PAWN) &  pos.pieces(Them);
++    const Bitboard capturable = pos.board_bb(Us, PAWN) & (pos.pieces(Them) | pos.self_capture_targets(Us));
+ 
+     target = Type == EVASIONS ? target : AllSquares;
+ 
+@@ -306,7 +306,7 @@ namespace {
+         PieceType promPt = pos.promoted_piece_type(Pt);
+         Bitboard b2 = promPt && (!pos.promotion_limit(promPt) || pos.promotion_limit(promPt) > pos.count(Us, promPt)) ? b1 : Bitboard(0);
+         Bitboard b3 = pos.piece_demotion() && pos.is_promoted(from) ? b1 : Bitboard(0);
+-        Bitboard pawnPromotions = (pos.promotion_pawn_types(Us) & Pt) ? (b & (Type == EVASIONS ? target : ~pos.pieces(Us)) & promotion_zone) : Bitboard(0);
++        Bitboard pawnPromotions = (pos.promotion_pawn_types(Us) & Pt) ? (b & (Type == EVASIONS ? target : ~pos.pieces(Us) | pos.self_capture_targets(Us)) & promotion_zone) : Bitboard(0);
+         Bitboard epSquares = (pos.en_passant_types(Us) & Pt) ? (attacks & ~quiets & pos.ep_squares() & ~pos.pieces()) : Bitboard(0);
+ 
+         // target squares considering pawn promotions
+@@ -385,8 +385,8 @@ namespace {
+     if (Type != EVASIONS || !more_than_one(pos.checkers() & ~pos.non_sliding_riders()))
+     {
+         target = Type == EVASIONS     ?  between_bb(ksq, lsb(pos.checkers()))
+-               : Type == NON_EVASIONS ? ~pos.pieces( Us)
+-               : Type == CAPTURES     ?  pos.pieces(~Us)
++               : Type == NON_EVASIONS ? ~pos.pieces( Us) | pos.self_capture_targets(Us)
++               : Type == CAPTURES     ?  pos.pieces(~Us) | pos.self_capture_targets(Us)
+                                       : ~pos.pieces(   ); // QUIETS || QUIET_CHECKS
+ 
+         if (Type == EVASIONS)
+@@ -456,7 +456,7 @@ namespace {
+     if (pos.count<KING>(Us) && (!Checks || pos.blockers_for_king(~Us) & ksq))
+     {
+         Bitboard b = (  (pos.attacks_from(Us, KING, ksq) & pos.pieces())
+-                      | (pos.moves_from(Us, KING, ksq) & ~pos.pieces())) & (Type == EVASIONS ? ~pos.pieces(Us) : target);
++                      | (pos.moves_from(Us, KING, ksq) & ~pos.pieces())) & (Type == EVASIONS ? ~pos.pieces(Us) | pos.self_capture_targets(Us) : target);
+         while (b)
+             moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, ksq, pop_lsb(b));
+ 
+diff --git a/src/parser.cpp b/src/parser.cpp
+index 96f35045..61663404 100644
+--- a/src/parser.cpp
++++ b/src/parser.cpp
+@@ -435,6 +435,7 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
+     parse_attribute("enPassantTypesWhite", v->enPassantTypes[WHITE], v->pieceToChar);
+     parse_attribute("enPassantTypesBlack", v->enPassantTypes[BLACK], v->pieceToChar);
+     parse_attribute("castling", v->castling);
++    parse_attribute("selfCapture", v->selfCapture);
+     parse_attribute("castlingDroppedPiece", v->castlingDroppedPiece);
+     parse_attribute("castlingKingsideFile", v->castlingKingsideFile);
+     parse_attribute("castlingQueensideFile", v->castlingQueensideFile);
+diff --git a/src/position.cpp b/src/position.cpp
+index 2b5ae3a7..9460e739 100644
+--- a/src/position.cpp
++++ b/src/position.cpp
+@@ -1371,7 +1371,7 @@ bool Position::pseudo_legal(const Move m) const {
+       return false;
+ 
+   // The destination square cannot be occupied by a friendly piece
+-  if (pieces(us) & to)
++  if ((pieces(us) & to) && !(self_capture_targets(us) & to))
+       return false;
+ 
+   // Handle the special case of a pawn move
+@@ -1382,7 +1382,7 @@ bool Position::pseudo_legal(const Move m) const {
+       if (mandatory_pawn_promotion() && (promotion_zone(us) & to) && !sittuyin_promotion())
+           return false;
+ 
+-      if (   !(pawn_attacks_bb(us, from) & pieces(~us) & to)     // Not a capture
++      if (   !(pawn_attacks_bb(us, from) & (pieces(~us) | self_capture_targets(us)) & to)     // Not a capture
+           && !((from + pawn_push(us) == to) && !(pieces() & to)) // Not a single push
+           && !(   (from + 2 * pawn_push(us) == to)               // Not a double push
+                && (double_step_region(us) & from)
+@@ -1629,7 +1629,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+       if (type_of(captured) == PAWN)
+           st->pawnKey ^= Zobrist::psq[captured][capsq];
+       else
+-          st->nonPawnMaterial[them] -= PieceValue[MG][captured];
++          st->nonPawnMaterial[color_of(captured)] -= PieceValue[MG][captured];   // a self-capture costs the mover
+ 
+       if (Eval::useNNUE)
+       {
+@@ -2499,6 +2499,10 @@ bool Position::see_ge(Move m, Value threshold) const {
+       || count<CLOBBER_PIECE>() == count<ALL_PIECES>())
+       return VALUE_ZERO >= threshold;
+ 
++  // Self-capture (Kramnik chess): the mover gives up the captured piece; approximate the exchange by that loss alone.
++  if (piece_on(to) && color_of(piece_on(to)) == sideToMove)
++      return -PieceValue[MG][piece_on(to)] >= threshold;
++
+   int swap = PieceValue[MG][piece_on(to)] - threshold;
+   if (swap < 0)
+       return false;
+diff --git a/src/position.h b/src/position.h
+index 685c0799..e4a3c182 100644
+--- a/src/position.h
++++ b/src/position.h
+@@ -146,6 +146,8 @@ public:
+   Bitboard double_step_region(Color c) const;
+   Bitboard triple_step_region(Color c) const;
+   bool castling_enabled() const;
++  bool self_capture() const;
++  Bitboard self_capture_targets(Color c) const;
+   bool castling_dropped_piece() const;
+   File castling_kingside_file() const;
+   File castling_queenside_file() const;
+@@ -538,6 +540,16 @@ inline bool Position::castling_enabled() const {
+   return var->castling;
+ }
+ 
++inline bool Position::self_capture() const {
++  assert(var != nullptr);
++  return var->selfCapture;
++}
++
++// Own pieces that side c may capture: everything but its king (Kramnik chess), or nothing.
++inline Bitboard Position::self_capture_targets(Color c) const {
++  return var->selfCapture ? pieces(c) & ~pieces(c, KING) : Bitboard(0);
++}
++
+ inline bool Position::castling_dropped_piece() const {
+   assert(var != nullptr);
+   return var->castlingDroppedPiece;
+diff --git a/src/search.cpp b/src/search.cpp
+index 651f6bd9..3f7740e2 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -37,6 +37,8 @@
+ #include "xboard.h"
+ #include "syzygy/tbprobe.h"
+ 
++#include "cmpersonality.h"
++
+ namespace Stockfish {
+ 
+ namespace Search {
+@@ -89,8 +91,11 @@ namespace {
+   }
+ 
+   // Add a small random component to draw evaluations to avoid 3-fold blindness
+-  Value value_draw(Thread* thisThread) {
+-    return VALUE_DRAW + Value(2 * (thisThread->nodes & 1) - 1);
++  Value value_draw(Thread* thisThread, Color stm) {
++    // CM-2 contempt: a draw is worth -contempt to the engine's side (root), +contempt to its opponent;
++    // CM-26: scaled by the material left at the root, so it fades toward the endgame
++    Value c = CM::W.contemptValue;
++    return VALUE_DRAW + Value(2 * (thisThread->nodes & 1) - 1) + (stm == CM::Root ? -c : c);
+   }
+ 
+   // Skill structure is used to implement strength limit
+@@ -175,6 +180,57 @@ void Search::clear() {
+ /// MainThread::search() is started when the program receives the UCI 'go'
+ /// command. It searches from the root position and outputs the "bestmove".
+ 
++namespace CM {
++  // Read the personality options (all neutral by default) -- called once per search, before the threads start.
++  void load(const Position& pos) {
++    Color root = pos.side_to_move();
++    static const char* names[TERM_NB] = { "Centre", "Mobility", "KingSafety", "PassedPawns", "PawnWeakness" };
++    static const char* pieces[] = { "", "Pawn", "Knight", "Bishop", "Rook", "Queen" };
++    Weights w;
++    bool active = false;
++    for (int side = 0; side < 2; ++side)
++    {
++        for (int t = 0; t < TERM_NB; ++t)
++        {
++            w.term[side][t] = int(Options[std::string("CM ") + names[t] + (side ? " Opp" : " Own")]);
++            active |= w.term[side][t] != 100;
++        }
++        for (int pt = 0; pt < PIECE_TYPE_NB; ++pt)
++            w.material[side][pt] = 100;
++        for (int pt = PAWN; pt <= QUEEN; ++pt)
++        {
++            w.material[side][pt] = int(Options[std::string("CM ") + pieces[pt] + (side ? " Opp" : " Own")]);
++            active |= w.material[side][pt] != 100;
++        }
++    }
++    w.contempt = int(Options["CM Contempt"]);
++    w.attack = int(Options["CM Attack"]);
++    w.active = active || w.attack != 0;
++
++    // CM-26: contempt x the material still on the board (1 at the start position, toward 0 in the endgame)
++    int material = pos.non_pawn_material() + PawnValueMg * pos.count<PAWN>();
++    int start = 2 * (2 * KnightValueMg + 2 * BishopValueMg + 2 * RookValueMg + QueenValueMg + 8 * PawnValueMg);
++    w.contemptValue = Value(w.contempt * PawnValueMg / 100 * std::min(material, start) / start);
++    w.noise = int(Options["CM Noise"]) * PawnValueEg / 100;
++    w.trade = int(Options["CM Trade"]) * PawnValueEg / 100;
++    w.tradeDown = bool(Options["CM Trade Down"]);
++    w.randomness = int(Options["CM Randomness"]);
++    int seed = int(Options["CM Seed"]);
++    w.salt = seed ? uint64_t(seed) * 0x2545F4914F6CDD1DULL ^ pos.key()      // reproducible (tests, matches)
++                  : uint64_t(now()) * 0x2545F4914F6CDD1DULL;                // once per search, from the clock
++    for (Color c : { WHITE, BLACK })
++        w.rootPieces[c] = pos.count<KNIGHT>(c) + pos.count<BISHOP>(c) + pos.count<ROOK>(c) + pos.count<QUEEN>(c);
++
++    static Color lastRoot = COLOR_NB;
++    if (   ((w.active || W.active) && lastRoot != COLOR_NB && lastRoot != root)
++        || w.trade || W.trade)
++        TT.clear();               // cached evaluations depend on which side is "own" (and the trades on the root)
++    lastRoot = root;
++    W = w;
++    Root = root;
++  }
++}
++
+ void MainThread::search() {
+ 
+   if (Limits.perft)
+@@ -185,6 +241,8 @@ void MainThread::search() {
+   }
+ 
+   Color us = rootPos.side_to_move();
++  if (this == Threads.main())
++      CM::load(rootPos);
+   Time.init(rootPos, Limits, us, rootPos.game_ply());
+   TT.new_search();
+ 
+@@ -663,10 +721,10 @@ namespace {
+     // if the opponent had an alternative move earlier to this position.
+     if (   !rootNode
+         && pos.rule50_count() >= 3
+-        && alpha < VALUE_DRAW
++        && alpha < value_draw(pos.this_thread(), pos.side_to_move())
+         && pos.has_game_cycle(ss->ply))
+     {
+-        alpha = value_draw(pos.this_thread());
++        alpha = value_draw(pos.this_thread(), pos.side_to_move());   // CM-16: the contempt-aware draw; only ever raises alpha
+         if (alpha >= beta)
+             return alpha;
+     }
+@@ -715,14 +773,14 @@ namespace {
+     if (!rootNode)
+     {
+         Value variantResult;
+-        if (pos.is_game_end(variantResult, ss->ply))
+-            return variantResult;
++        if (pos.is_game_end(variantResult, ss->ply))   // CM-16: a repetition or 50-move draw carries the contempt too
++            return variantResult == VALUE_DRAW ? value_draw(pos.this_thread(), pos.side_to_move()) : variantResult;
+ 
+         // Step 2. Check for aborted search and immediate draw
+         if (   Threads.stop.load(std::memory_order_relaxed)
+             || ss->ply >= MAX_PLY)
+             return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos)
+-                                                        : value_draw(pos.this_thread());
++                                                        : value_draw(pos.this_thread(), pos.side_to_move());
+ 
+         // Step 3. Mate distance pruning. Even if we mate at the next move our score
+         // would be at best mate_in(ss->ply+1), but if alpha is already bigger because
+@@ -886,7 +944,7 @@ namespace {
+ 
+         // Randomize draw evaluation
+         if (eval == VALUE_DRAW)
+-            eval = value_draw(thisThread);
++            eval = value_draw(thisThread, pos.side_to_move());
+ 
+         // Can ttValue be used as a better position evaluation?
+         if (    ttValue != VALUE_NONE
+@@ -1273,6 +1331,16 @@ moves_loop: // When in check, search starts from here
+                                                                 [history_slot(movedPiece)]
+                                                                 [to_sq(move)];
+ 
++      // CM-26 randomness: a root move is searched as if worth its fixed bias more, by shifting
++      // the window, so every bound and re-search stays consistent; the bias is added back after the search.
++      Value cmBias = rootNode ? CM::root_bias(move) : VALUE_ZERO;
++      Value cmAlpha = alpha, cmBeta = beta;
++      if (cmBias)
++      {
++          alpha = std::clamp(alpha - cmBias, -VALUE_INFINITE, VALUE_INFINITE);
++          beta  = std::clamp(beta  - cmBias, -VALUE_INFINITE, VALUE_INFINITE);
++      }
++
+       // Step 15. Make the move
+       pos.do_move(move, st, givesCheck);
+ 
+@@ -1385,6 +1453,13 @@ moves_loop: // When in check, search starts from here
+       // Step 18. Undo move
+       pos.undo_move(move);
+ 
++      if (cmBias)
++      {
++          alpha = cmAlpha;
++          beta  = cmBeta;
++          value = std::clamp(value + cmBias, -VALUE_INFINITE + 1, VALUE_INFINITE - 1);
++      }
++
+       assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
+ 
+       // Step 19. Check for a new best move
+@@ -1548,7 +1623,7 @@ moves_loop: // When in check, search starts from here
+ 
+     Value gameResult;
+     if (pos.is_game_end(gameResult, ss->ply))
+-        return gameResult;
++        return gameResult == VALUE_DRAW ? value_draw(pos.this_thread(), pos.side_to_move()) : gameResult;
+ 
+     // Check for maximum ply reached
+     if (ss->ply >= MAX_PLY)
+diff --git a/src/ucioption.cpp b/src/ucioption.cpp
+index 0326e047..6e6810ec 100644
+--- a/src/ucioption.cpp
++++ b/src/ucioption.cpp
+@@ -208,6 +208,23 @@ void init(OptionsMap& o) {
+ #endif
+   o["TsumeMode"]             << Option(false);
+   o["VariantPath"]           << Option("<empty>", on_variant_path);
++  // Kramnik chess CM-2: Chessmaster-style personality, relative to the engine's side ("Own") and the other side ("Opp").
++  // Percent weights (100 = unchanged), contempt in centipawns, attack -100..100. All neutral by default.
++  for (const char* t : { "Centre", "Mobility", "KingSafety", "PassedPawns", "PawnWeakness",
++                         "Pawn", "Knight", "Bishop", "Rook", "Queen" })
++      for (const char* side : { " Own", " Opp" })
++          o[std::string("CM ") + t + side] << Option(100, 0, 400);
++  o["CM Contempt"]           << Option(0, -1000, 1000);
++  o["CM Attack"]             << Option(0, -100, 100);
++  // CM-26 (2026-10-28): the remaining personality settings. Noise: centipawn amplitude of a
++  // position-seeded evaluation error; Trade: centipawns per piece traded since the root; Trade Down: the side ahead
++  // gains as the other's pieces come off; Randomness: a fixed root-move bias up to +-r/2 centipawns, salted once per
++  // search (from the clock, or from Seed when it is not 0, for reproducible matches).
++  o["CM Noise"]              << Option(0, 0, 6000);
++  o["CM Trade"]              << Option(0, -100, 100);
++  o["CM Trade Down"]         << Option(false);
++  o["CM Randomness"]         << Option(0, 0, 100);
++  o["CM Seed"]               << Option(0, 0, 2147483647);
+   o["usemillisec"]           << Option(true); // time unit for UCCI
+ }
+ 
+diff --git a/src/variant.h b/src/variant.h
+index 0e6d44c3..5850008a 100644
+--- a/src/variant.h
++++ b/src/variant.h
+@@ -74,6 +74,7 @@ struct Variant {
+   Bitboard enPassantRegion[COLOR_NB] = {AllSquares, AllSquares};
+   PieceSet enPassantTypes[COLOR_NB] = {piece_set(PAWN), piece_set(PAWN)};
+   bool castling = true;
++  bool selfCapture = false;   // Kramnik chess: a piece may capture its own pieces (never its own king)
+   bool castlingDroppedPiece = false;
+   File castlingKingsideFile = FILE_G;
+   File castlingQueensideFile = FILE_C;
