@@ -58,6 +58,11 @@ may take its own pieces too). It's Wednesday's game in Serious Games Week ([seri
   Chessmaster's own coach: the board shows danger zones (a move there
   loses material once the exchanges on that square are played out) and safe zones, and a blunder alert stops the
   clock and offers a take-back when your move throws away more than a threshold you set (3 pawns by default).
+  Move hints as arrows: captures in red (thick when the capture wins material once the exchanges are played out;
+  one that loses material is not shown), the defenders of your attacked pieces in green, pin and skewer moves
+  dotted red, check and checkmate moves in mauve; "other side" (Ctrl+Tab) shows the same for your opponent. The
+  pawn hint draws isolated and passed pawns faint. A board coverage overlay shades the squares your pieces cover
+  green, your opponent's red, and both amber.
 - After each game against the computer, the **Post-Game Analysis** reads the game: its type, the costliest moves, a
   comment that weighs the result against the rating gap, the evaluation chart and a suggested next opponent.
 - **Time controls:** Fischer 10+3 (and 5+3, 15+10, 3+2), 30 minutes per game, 40 moves in 90 minutes, or untimed.

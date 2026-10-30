@@ -6,8 +6,8 @@ import threading
 import time
 import sys
 
-from PyQt6.QtCore import QRectF, QSettings, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPen
+from PyQt6.QtCore import QPointF, QRectF, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
                              QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTextBrowser,
@@ -23,8 +23,16 @@ from .net import DEFAULT_PORT, Link
 LIGHT, DARK = QColor("#f0d9b5"), QColor("#b58863")
 LAST, SEL = QColor(246, 246, 105, 150), QColor(90, 160, 255, 140)
 MOVE_DOT, ENEMY_RING, SELF_RING, BOOK = QColor(20, 20, 20, 90), QColor("#d04040"), QColor("#9b4dca"), QColor("#2f7de1")
-ZONE = {"danger": QColor(220, 40, 40, 85), "safe": QColor(40, 170, 70, 75)}      # the coach's board overlay (CM-26)
-OVERLAYS = (("Off", ""), ("Danger zones", "danger"), ("Safe zones", "safe"), ("Danger and safe zones", "both"))
+ZONE = {"danger": QColor(220, 40, 40, 85), "safe": QColor(40, 170, 70, 75),       # the coach's board overlay (CM-26)
+        "own": QColor(40, 170, 70, 60), "opp": QColor(220, 40, 40, 60), "contested": QColor(230, 170, 30, 70)}
+OVERLAYS = (("Off", ""), ("Danger zones", "danger"), ("Safe zones", "safe"), ("Danger and safe zones", "both"),
+            ("Coverage (yours green, theirs red, both amber)", "coverage"))
+# CM-28: the coach's move hints as arrows, in Chessmaster's colours (captures and pins red, defenders green, checks
+# mauve; pins dotted; a fat arrow = a capture that wins material, or checkmate)
+ARROW = {"capture": QColor(215, 40, 40, 200), "pin": QColor(215, 40, 40, 200), "defend": QColor(40, 160, 70, 200),
+         "check": QColor(170, 70, 200, 210)}
+CUE_MENU = (("capture", "Moves: &capture moves (and the defenders of attacked pieces)"),
+            ("pin", "Moves: &pin and skewer moves"), ("check", "Moves: chec&k and checkmate moves"))
 
 
 def settings():
@@ -49,6 +57,8 @@ class BoardWidget(QWidget):
         self.targets = []           # legal moves of the selected piece
         self.hints = []             # book moves
         self.zones = {}             # the coach's overlay: square -> "danger" | "safe"
+        self.arrows = []            # the coach's move hints: (from, to, kind, weight), CM-28
+        self.faded = set()          # the coach's pawn hints: isolated / passed pawns drawn half-transparent, CM-29
         self.font_family = "DejaVu Sans"
 
     def geometry_(self):
@@ -68,6 +78,35 @@ class BoardWidget(QWidget):
         i = self.square_at(ev.position().x(), ev.position().y())
         if i is not None:
             self.clicked.emit(i)
+
+    def _centre(self, i, ox, oy, sq):
+        r, c = i >> 3, i & 7
+        dr, dc = (r, c) if self.orient == "w" else (7 - r, 7 - c)
+        return QPointF(ox + (dc + 0.5) * sq, oy + (dr + 0.5) * sq)
+
+    def _arrow(self, p, frm, to, kind, weight, ox, oy, sq):
+        """One coach arrow from square to square: shaft, then a filled head."""
+        a, b = self._centre(frm, ox, oy, sq), self._centre(to, ox, oy, sq)
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        n = (dx * dx + dy * dy) ** 0.5 or 1.0
+        ux, uy = dx / n, dy / n
+        width = sq * (0.13 if weight == "fat" else 0.06)
+        head = sq * (0.32 if weight == "fat" else 0.24)
+        tip = QPointF(b.x() - ux * sq * 0.18, b.y() - uy * sq * 0.18)
+        base = QPointF(tip.x() - ux * head, tip.y() - uy * head)
+        col = ARROW[kind]
+        pen = QPen(col, width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        if kind == "pin":
+            pen.setStyle(Qt.PenStyle.DotLine)
+        p.setPen(pen)
+        p.drawLine(QPointF(a.x() + ux * sq * 0.2, a.y() + uy * sq * 0.2), base)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        w = head * 0.6
+        p.drawPolygon(QPolygonF([tip, QPointF(base.x() - uy * w, base.y() + ux * w),
+                                 QPointF(base.x() + uy * w, base.y() - ux * w)]))
+        p.setBrush(Qt.BrushStyle.NoBrush)
 
     def paintEvent(self, _ev):
         p = QPainter(self)
@@ -97,6 +136,8 @@ class BoardWidget(QWidget):
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRect(rect.adjusted(sq * 0.04, sq * 0.04, -sq * 0.04, -sq * 0.04))
                 piece = self.board[i]
+                if piece and i in self.faded:
+                    p.setOpacity(0.45)
                 if piece:
                     # the font rasterizer draws the glyphs (filling them as QPainterPaths inverted the kings at
                     # some sizes): black = the solid glyph in black; white = the solid glyph in white as a body,
@@ -111,6 +152,7 @@ class BoardWidget(QWidget):
                     else:
                         p.setPen(QColor("#111"))
                         p.drawText(rect, flags, E.GLYPH["b"][piece[1]])
+                p.setOpacity(1.0)
                 if i in hint_to:
                     p.setPen(Qt.PenStyle.NoPen)
                     p.setBrush(BOOK)
@@ -132,6 +174,8 @@ class BoardWidget(QWidget):
                 if dr == 7:
                     p.drawText(rect.adjusted(0, 0, -3, -2), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
                                "abcdefgh"[c])
+        for frm, to, kind, weight in self.arrows:
+            self._arrow(p, frm, to, kind, weight, ox, oy, sq)
         p.end()
 
 
@@ -550,6 +594,26 @@ class MainWindow(QMainWindow):
             group.addAction(act)
             cm.addAction(act)
         cm.addSeparator()
+        saved_cues = [k for k in str(settings().value("cues", "")).split(",") if k in coach.CUES]
+        self.cue_acts = {}
+        for key, label in CUE_MENU:
+            act = QAction(label, self, checkable=True)
+            act.setChecked(key in saved_cues)
+            act.toggled.connect(self._cues_changed)
+            self.cue_acts[key] = act
+            cm.addAction(act)
+        self.pawn_act = QAction("Pieces: &isolated and passed pawns (drawn faint)", self, checkable=True)
+        self.pawn_act.setChecked(settings().value("pawn_hints", "false") == "true")
+        self.pawn_act.toggled.connect(lambda on: (settings().setValue("pawn_hints", "true" if on else "false"),
+                                                  self.render()))
+        cm.addAction(self.pawn_act)
+        self.cue_other = QAction("Show the move hints for the &other side", self, checkable=True)
+        self.cue_other.setShortcut("Ctrl+Tab")
+        self.cue_other.setToolTip("As Chessmaster's Tab key: the same hints for your opponent, to see what it "
+                                  "threatens")
+        self.cue_other.toggled.connect(self._cues_changed)
+        cm.addAction(self.cue_other)
+        cm.addSeparator()
         self.alert_act = QAction("&Blunder alert (offers a take-back)", self, checkable=True)
         self.alert_act.setChecked(settings().value("blunder_alert", "false") == "true")
         self.alert_act.toggled.connect(lambda on: settings().setValue(
@@ -584,6 +648,21 @@ class MainWindow(QMainWindow):
         settings().setValue("overlay", key)
         self.render()
 
+    def _cues_changed(self, _on=False):
+        settings().setValue("cues", ",".join(k for k, act in self.cue_acts.items() if act.isChecked()))
+        self.render()
+
+    def _cues(self):
+        """CM-28: the coach's move hints for the side to move (or, with "other side", for the opponent), on the
+        local player's turn in practice games, as the overlay."""
+        g = self.game
+        kinds = tuple(k for k, act in getattr(self, "cue_acts", {}).items() if act.isChecked())
+        if not kinds or not self._coach_on() or self.review is not None or not g.local_to_move() or g.over:
+            return []
+        if self.cue_other.isChecked():
+            return coach.cues(g.board, E.opp(g.turn), None, kinds)
+        return coach.cues(g.board, g.turn, g.ep, kinds)
+
     def _threshold(self):
         return int(settings().value("blunder_threshold", coach.THRESHOLD))
 
@@ -602,6 +681,8 @@ class MainWindow(QMainWindow):
         g, bw = self.game, self.boardw
         if not self.overlay or not self._coach_on() or self.review is not None or not g.local_to_move() or g.over:
             return {}
+        if self.overlay == "coverage":
+            return coach.coverage(g.board, g.turn)
         moves = bw.targets if bw.selected is not None else g.legal()
         z = coach.zones(g.board, g.turn, g.ep, moves)
         return z if self.overlay == "both" else {k: v for k, v in z.items() if v == self.overlay}
@@ -1408,6 +1489,9 @@ class MainWindow(QMainWindow):
         if not live:
             bw.selected, bw.targets = None, []
         bw.zones = self._zones()
+        bw.arrows = self._cues()
+        bw.faded = (set(coach.pawn_hints(bw.board)) if getattr(self, "pawn_act", None) and self.pawn_act.isChecked()
+                    and self._coach_on() else set())
         bw.update()
         self.status.setText(self._status_html(thinking))
         self._render_moves(ply)
